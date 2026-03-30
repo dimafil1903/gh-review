@@ -182,18 +182,23 @@ def review_push(repo, branch, commits, pusher, compare_url):
 
     logger.info(f"Reviewing push to {repo}/{branch} ({len(commits)} commits)...")
 
-    # Review all commits combined via compare diff, fallback to latest commit
     latest_sha = commits[-1]["id"]
-    first_sha = commits[0]["id"]
 
     if len(commits) > 1:
-        # Multiple commits — use compare endpoint for full diff
+        # Multiple commits — use compare endpoint (before...after)
+        # GitHub compare uses SHAs directly, no ~1 needed
+        first_sha = commits[0]["id"]
         try:
-            diff = gh_get_diff(f"/repos/{repo}/compare/{first_sha}~1...{latest_sha}")
-        except Exception:
+            diff = gh_get_diff(f"/repos/{repo}/compare/{first_sha}...{latest_sha}")
+        except Exception as e:
+            logger.warning(f"Compare diff failed ({e}), falling back to latest commit")
             diff = gh_get_diff(f"/repos/{repo}/commits/{latest_sha}")
     else:
         diff = gh_get_diff(f"/repos/{repo}/commits/{latest_sha}")
+
+    if not diff.strip():
+        logger.info("Empty diff, skipping review")
+        return
 
     truncated = ""
     if len(diff) > MAX_DIFF_SIZE:

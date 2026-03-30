@@ -4,15 +4,31 @@ GitHub code reviewer — fetches diff, runs claude -p for review, posts to GitHu
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-CLAUDE_BIN = os.path.expanduser("~/.nvm/versions/node/v24.11.0/bin/claude")
+
+# Resolve claude binary: env override → PATH → known nvm location
+CLAUDE_BIN = (
+    os.environ.get("CLAUDE_BIN_PATH")
+    or shutil.which("claude")
+    or os.path.expanduser("~/.nvm/versions/node/v24.11.0/bin/claude")
+)
+
+MAX_DIFF_SIZE = 50_000
+CLAUDE_TIMEOUT = 600
+REVIEWED_BRANCHES = os.environ.get("REVIEW_BRANCHES", "main,master,develop,dev").split(",")
 
 GH_HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
@@ -21,65 +37,125 @@ GH_HEADERS = {
 
 
 def gh_get_diff(path):
-    r = httpx.get(
-        f"https://api.github.com{path}",
-        headers={**GH_HEADERS, "Accept": "application/vnd.github.v3.diff"},
-        follow_redirects=True,
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.text
+    try:
+        r = httpx.get(
+            f"https://api.github.com{path}",
+            headers={**GH_HEADERS, "Accept": "application/vnd.github.v3.diff"},
+            follow_redirects=True,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.text
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"GitHub API error {e.response.status_code}: {e.response.text[:200]}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch diff: {e}")
 
 
 def gh_post(path, data):
-    r = httpx.post(
-        f"https://api.github.com{path}",
-        headers=GH_HEADERS,
-        json=data,
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = httpx.post(
+            f"https://api.github.com{path}",
+            headers=GH_HEADERS,
+            json=data,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"GitHub post error {e.response.status_code}: {e.response.text[:200]}")
 
 
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured, skipping", file=sys.stderr)
         return
     chunks = [text[i:i+4000] for i in range(0, min(len(text), 12000), 4000)]
     for chunk in chunks:
+        for attempt in range(3):
+            try:
+                r = httpx.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": chunk,
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=15,
+                )
+                r.raise_for_status()
+                break
+            except Exception as e:
+                print(f"Telegram attempt {attempt+1} failed: {e}", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+
+
+def call_claude(prompt, retries=3):
+    """Call claude -p via stdin to avoid prompt leaking in ps aux"""
+    for attempt in range(retries):
         try:
-            httpx.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": chunk,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True,
-                },
-                timeout=15,
-            )
+            # Write prompt to temp file to avoid cmdline exposure
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(prompt)
+                tmp_path = f.name
+            try:
+                result = subprocess.run(
+                    [CLAUDE_BIN, "-p", f"$(cat {tmp_path})"],
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=CLAUDE_TIMEOUT,
+                    env={**os.environ, "CLAUDE_BIN_PATH": CLAUDE_BIN},
+                )
+            finally:
+                os.unlink(tmp_path)
+
+            if result.returncode != 0:
+                raise RuntimeError(f"claude exited {result.returncode}: {result.stderr[:300]}")
+            return result.stdout.strip()
         except Exception as e:
-            print(f"Telegram error: {e}", file=sys.stderr)
+            print(f"Claude attempt {attempt+1} failed: {e}", file=sys.stderr)
+            if attempt < retries - 1:
+                time.sleep(5 ** attempt)
+            else:
+                raise
 
 
-def call_claude(prompt):
-    result = subprocess.run(
-        [CLAUDE_BIN, "-p", prompt],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude failed: {result.stderr[:500]}")
-    return result.stdout.strip()
+def call_claude_stdin(prompt, retries=3):
+    """Pass prompt via stdin using -p -"""
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(
+                [CLAUDE_BIN, "-p", "-"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=CLAUDE_TIMEOUT,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"claude exited {result.returncode}: {result.stderr[:300]}")
+            output = result.stdout.strip()
+            if not output:
+                raise RuntimeError("claude returned empty output")
+            return output
+        except Exception as e:
+            print(f"Claude stdin attempt {attempt+1} failed: {e}", file=sys.stderr)
+            if attempt < retries - 1:
+                time.sleep(5 ** attempt)
+            else:
+                raise
 
 
 def review_pr(repo, pr_number, pr_title, pr_url, pr_author, base_branch, head_branch):
     print(f"Reviewing PR #{pr_number} in {repo}...")
 
     diff = gh_get_diff(f"/repos/{repo}/pulls/{pr_number}")
-    if len(diff) > 50000:
-        diff = diff[:50000] + "\n... [diff truncated]"
+    truncated = ""
+    if len(diff) > MAX_DIFF_SIZE:
+        truncated = f"\n\n⚠️ Diff truncated: показано {MAX_DIFF_SIZE} з {len(diff)} символів"
+        diff = diff[:MAX_DIFF_SIZE]
 
     prompt = f"""Ти — senior code reviewer. Зроби детальний code review для цього Pull Request.
 
@@ -87,7 +163,7 @@ def review_pr(repo, pr_number, pr_title, pr_url, pr_author, base_branch, head_br
 PR #{pr_number}: {pr_title}
 Автор: {pr_author}
 Гілки: {head_branch} → {base_branch}
-URL: {pr_url}
+URL: {pr_url}{truncated}
 
 DIFF:
 ```diff
@@ -104,7 +180,7 @@ DIFF:
 
 Будь конкретним — вказуй файли та рядки. Фокус на реальних проблемах."""
 
-    review = call_claude(prompt)
+    review = call_claude_stdin(prompt)
     print(f"Review generated ({len(review)} chars)")
 
     try:
@@ -119,13 +195,17 @@ DIFF:
 
 def review_push(repo, branch, commits, pusher, compare_url):
     if not commits:
+        print("No commits, skipping")
         return
+
     print(f"Reviewing push to {repo}/{branch}...")
 
     latest_sha = commits[-1]["id"]
     diff = gh_get_diff(f"/repos/{repo}/commits/{latest_sha}")
-    if len(diff) > 50000:
-        diff = diff[:50000] + "\n... [diff truncated]"
+    truncated = ""
+    if len(diff) > MAX_DIFF_SIZE:
+        truncated = f"\n\n⚠️ Diff truncated: показано {MAX_DIFF_SIZE} з {len(diff)} символів"
+        diff = diff[:MAX_DIFF_SIZE]
 
     commit_msgs = "\n".join([
         f"- {c['message'].splitlines()[0]} ({c['id'][:7]})"
@@ -138,7 +218,7 @@ def review_push(repo, branch, commits, pusher, compare_url):
 Гілка: {branch}
 Автор: {pusher}
 Коміти:
-{commit_msgs}
+{commit_msgs}{truncated}
 
 DIFF:
 ```diff
@@ -155,7 +235,7 @@ DIFF:
 
 Будь конкретним — вказуй файли та рядки."""
 
-    review = call_claude(prompt)
+    review = call_claude_stdin(prompt)
     print(f"Review generated ({len(review)} chars)")
 
     try:
@@ -169,25 +249,37 @@ DIFF:
 
 
 if __name__ == "__main__":
-    event = json.loads(sys.argv[1])
+    if len(sys.argv) < 3:
+        print("Usage: reviewer.py <json_payload> <event_type>", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        event = json.loads(sys.argv[1])
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON payload: {e}", file=sys.stderr)
+        sys.exit(1)
+
     event_type = sys.argv[2]
 
     if event_type == "pull_request":
-        pr = event["pull_request"]
+        pr = event.get("pull_request", {})
         review_pr(
             repo=event["repository"]["full_name"],
             pr_number=pr["number"],
-            pr_title=pr["title"],
-            pr_url=pr["html_url"],
-            pr_author=pr["user"]["login"],
-            base_branch=pr["base"]["ref"],
-            head_branch=pr["head"]["ref"],
+            pr_title=pr.get("title", ""),
+            pr_url=pr.get("html_url", ""),
+            pr_author=pr.get("user", {}).get("login", "unknown"),
+            base_branch=pr.get("base", {}).get("ref", ""),
+            head_branch=pr.get("head", {}).get("ref", ""),
         )
     elif event_type == "push":
         review_push(
             repo=event["repository"]["full_name"],
             branch=event["ref"].replace("refs/heads/", ""),
             commits=event.get("commits", []),
-            pusher=event["pusher"]["name"],
+            pusher=event.get("pusher", {}).get("name", "unknown"),
             compare_url=event.get("compare", ""),
         )
+    else:
+        print(f"Unknown event type: {event_type}", file=sys.stderr)
+        sys.exit(1)

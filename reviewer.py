@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-GitHub code reviewer — fetches diff, runs claude -p for review, posts to GitHub + Telegram
+GitHub code reviewer — fetches diff, runs claude -p - for review, posts to GitHub + Telegram
 """
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 import httpx
@@ -15,13 +15,15 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# Resolve claude binary: env override → PATH → known nvm location
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
 CLAUDE_BIN = (
-    os.environ.get("CLAUDE_BIN_PATH")
+    os.environ.get("CLAUDE_BIN_PATH", "").strip()
     or shutil.which("claude")
     or os.path.expanduser("~/.nvm/versions/node/v24.11.0/bin/claude")
 )
@@ -29,6 +31,17 @@ CLAUDE_BIN = (
 MAX_DIFF_SIZE = 50_000
 CLAUDE_TIMEOUT = 600
 REVIEWED_BRANCHES = os.environ.get("REVIEW_BRANCHES", "main,master,develop,dev").split(",")
+
+# Startup validation
+_errors = []
+if not GITHUB_TOKEN:
+    _errors.append("GITHUB_TOKEN is not set")
+if not os.path.exists(CLAUDE_BIN):
+    _errors.append(f"Claude binary not found: {CLAUDE_BIN}")
+if _errors:
+    for e in _errors:
+        logger.error(f"Config error: {e}")
+    sys.exit(1)
 
 GH_HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
@@ -68,7 +81,7 @@ def gh_post(path, data):
 
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured, skipping", file=sys.stderr)
+        logger.warning("Telegram not configured, skipping")
         return
     chunks = [text[i:i+4000] for i in range(0, min(len(text), 12000), 4000)]
     for chunk in chunks:
@@ -87,44 +100,13 @@ def send_telegram(text):
                 r.raise_for_status()
                 break
             except Exception as e:
-                print(f"Telegram attempt {attempt+1} failed: {e}", file=sys.stderr)
+                logger.warning(f"Telegram attempt {attempt+1} failed: {e}")
                 if attempt < 2:
                     time.sleep(2 ** attempt)
 
 
 def call_claude(prompt, retries=3):
-    """Call claude -p via stdin to avoid prompt leaking in ps aux"""
-    for attempt in range(retries):
-        try:
-            # Write prompt to temp file to avoid cmdline exposure
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                f.write(prompt)
-                tmp_path = f.name
-            try:
-                result = subprocess.run(
-                    [CLAUDE_BIN, "-p", f"$(cat {tmp_path})"],
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=CLAUDE_TIMEOUT,
-                    env={**os.environ, "CLAUDE_BIN_PATH": CLAUDE_BIN},
-                )
-            finally:
-                os.unlink(tmp_path)
-
-            if result.returncode != 0:
-                raise RuntimeError(f"claude exited {result.returncode}: {result.stderr[:300]}")
-            return result.stdout.strip()
-        except Exception as e:
-            print(f"Claude attempt {attempt+1} failed: {e}", file=sys.stderr)
-            if attempt < retries - 1:
-                time.sleep(5 ** attempt)
-            else:
-                raise
-
-
-def call_claude_stdin(prompt, retries=3):
-    """Pass prompt via stdin using -p -"""
+    """Pass prompt via stdin to avoid cmdline exposure in ps aux"""
     for attempt in range(retries):
         try:
             result = subprocess.run(
@@ -141,15 +123,15 @@ def call_claude_stdin(prompt, retries=3):
                 raise RuntimeError("claude returned empty output")
             return output
         except Exception as e:
-            print(f"Claude stdin attempt {attempt+1} failed: {e}", file=sys.stderr)
+            logger.warning(f"Claude attempt {attempt+1} failed: {e}")
             if attempt < retries - 1:
-                time.sleep(5 ** attempt)
+                time.sleep(2 ** attempt)
             else:
                 raise
 
 
 def review_pr(repo, pr_number, pr_title, pr_url, pr_author, base_branch, head_branch):
-    print(f"Reviewing PR #{pr_number} in {repo}...")
+    logger.info(f"Reviewing PR #{pr_number} in {repo}...")
 
     diff = gh_get_diff(f"/repos/{repo}/pulls/{pr_number}")
     truncated = ""
@@ -180,28 +162,39 @@ DIFF:
 
 Будь конкретним — вказуй файли та рядки. Фокус на реальних проблемах."""
 
-    review = call_claude_stdin(prompt)
-    print(f"Review generated ({len(review)} chars)")
+    review = call_claude(prompt)
+    logger.info(f"Review generated ({len(review)} chars)")
 
     try:
         gh_post(f"/repos/{repo}/issues/{pr_number}/comments", {"body": review})
-        print("Posted comment to PR ✅")
+        logger.info("Posted comment to PR ✅")
     except Exception as e:
-        print(f"Failed to post PR comment: {e}", file=sys.stderr)
+        logger.error(f"Failed to post PR comment: {e}")
 
     send_telegram(f"🔍 *Code Review: [{repo}#{pr_number}]({pr_url})*\n_{pr_title}_\n\n{review}")
-    print("Sent Telegram ✅")
+    logger.info("Sent Telegram ✅")
 
 
 def review_push(repo, branch, commits, pusher, compare_url):
     if not commits:
-        print("No commits, skipping")
+        logger.info("No commits, skipping")
         return
 
-    print(f"Reviewing push to {repo}/{branch}...")
+    logger.info(f"Reviewing push to {repo}/{branch} ({len(commits)} commits)...")
 
+    # Review all commits combined via compare diff, fallback to latest commit
     latest_sha = commits[-1]["id"]
-    diff = gh_get_diff(f"/repos/{repo}/commits/{latest_sha}")
+    first_sha = commits[0]["id"]
+
+    if len(commits) > 1:
+        # Multiple commits — use compare endpoint for full diff
+        try:
+            diff = gh_get_diff(f"/repos/{repo}/compare/{first_sha}~1...{latest_sha}")
+        except Exception:
+            diff = gh_get_diff(f"/repos/{repo}/commits/{latest_sha}")
+    else:
+        diff = gh_get_diff(f"/repos/{repo}/commits/{latest_sha}")
+
     truncated = ""
     if len(diff) > MAX_DIFF_SIZE:
         truncated = f"\n\n⚠️ Diff truncated: показано {MAX_DIFF_SIZE} з {len(diff)} символів"
@@ -217,7 +210,7 @@ def review_push(repo, branch, commits, pusher, compare_url):
 Репо: {repo}
 Гілка: {branch}
 Автор: {pusher}
-Коміти:
+Коміти ({len(commits)}):
 {commit_msgs}{truncated}
 
 DIFF:
@@ -235,28 +228,28 @@ DIFF:
 
 Будь конкретним — вказуй файли та рядки."""
 
-    review = call_claude_stdin(prompt)
-    print(f"Review generated ({len(review)} chars)")
+    review = call_claude(prompt)
+    logger.info(f"Review generated ({len(review)} chars)")
 
     try:
         gh_post(f"/repos/{repo}/commits/{latest_sha}/comments", {"body": review})
-        print("Posted commit comment ✅")
+        logger.info("Posted commit comment ✅")
     except Exception as e:
-        print(f"Failed to post commit comment: {e}", file=sys.stderr)
+        logger.error(f"Failed to post commit comment: {e}")
 
     send_telegram(f"🔍 *Push Review: [{repo}]({compare_url})* → `{branch}`\n\n{review}")
-    print("Sent Telegram ✅")
+    logger.info("Sent Telegram ✅")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: reviewer.py <json_payload> <event_type>", file=sys.stderr)
+        logger.error("Usage: reviewer.py <json_payload> <event_type>")
         sys.exit(1)
 
     try:
         event = json.loads(sys.argv[1])
     except json.JSONDecodeError as e:
-        print(f"Invalid JSON payload: {e}", file=sys.stderr)
+        logger.error(f"Invalid JSON payload: {e}")
         sys.exit(1)
 
     event_type = sys.argv[2]
@@ -281,5 +274,5 @@ if __name__ == "__main__":
             compare_url=event.get("compare", ""),
         )
     else:
-        print(f"Unknown event type: {event_type}", file=sys.stderr)
+        logger.error(f"Unknown event type: {event_type}")
         sys.exit(1)

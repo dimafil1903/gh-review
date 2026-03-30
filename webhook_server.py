@@ -7,7 +7,8 @@ import hmac
 import json
 import logging
 import os
-import httpx
+import subprocess
+import sys
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
@@ -30,151 +31,50 @@ def verify_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-async def trigger_review(event_type: str, payload: dict):
-    """Trigger OpenClaw isolated agent to do code review"""
+def trigger_review(event_type: str, payload: dict):
+    """Trigger reviewer.py subprocess for code review"""
     repo = payload.get("repository", {}).get("full_name", "unknown")
-    
+
     if event_type == "pull_request":
         action = payload.get("action", "")
         if action not in ("opened", "synchronize", "reopened"):
             logger.info(f"Ignoring PR action: {action}")
             return
-        
-        pr = payload.get("pull_request", {})
-        pr_number = pr.get("number")
-        pr_title = pr.get("title", "")
-        pr_url = pr.get("html_url", "")
-        pr_author = pr.get("user", {}).get("login", "unknown")
-        base_branch = pr.get("base", {}).get("ref", "")
-        head_branch = pr.get("head", {}).get("ref", "")
-        
-        message = f"""You are a senior code reviewer. Review this GitHub Pull Request and provide detailed feedback.
-
-TASK: Code review for PR #{pr_number} in {repo}
-PR Title: {pr_title}
-Author: {pr_author}
-Branch: {head_branch} → {base_branch}
-PR URL: {pr_url}
-
-Steps:
-1. Fetch the PR diff using exec:
-   curl -s -H "Authorization: token {GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.diff" https://api.github.com/repos/{repo}/pulls/{pr_number}
-
-2. Analyze the diff carefully. Look for:
-   - Bugs, logic errors, edge cases
-   - Security vulnerabilities (SQL injection, XSS, auth issues, etc.)
-   - Performance problems
-   - Code style/readability issues
-   - Missing error handling
-   - Test coverage gaps
-   - Architecture/design concerns
-
-3. Write a detailed review in Ukrainian with clear sections:
-   **🔴 Критичні проблеми** (якщо є)
-   **🟡 Попередження**
-   **🟢 Хороші рішення**
-   **💡 Пропозиції**
-   **Підсумок**
-
-4. Post the review as a PR comment using exec:
-   curl -s -X POST \\
-     -H "Authorization: token {GITHUB_TOKEN}" \\
-     -H "Content-Type: application/json" \\
-     https://api.github.com/repos/{repo}/issues/{pr_number}/comments \\
-     -d '{{"body": "<YOUR_REVIEW_HERE>"}}'
-
-5. Send a summary to Telegram using the sessions_send tool with sessionKey="main" and include the repo name, PR number, title, and key findings. Start with "🔍 Code Review: [{repo}#{pr_number}]({pr_url})".
-
-Be thorough but concise. Focus on actionable feedback."""
-
     elif event_type == "push":
         ref = payload.get("ref", "")
         branch = ref.replace("refs/heads/", "")
         commits = payload.get("commits", [])
-        pusher = payload.get("pusher", {}).get("name", "unknown")
-        
         if not commits:
             return
-        
-        # Only review pushes to main/master/develop
         if branch not in ("main", "master", "develop", "dev"):
             logger.info(f"Ignoring push to branch: {branch}")
             return
-        
-        commit_msgs = "\n".join([f"- {c.get('message','').split(chr(10))[0]} ({c.get('id','')[:7]})" for c in commits[:10]])
-        compare_url = payload.get("compare", "")
-        
-        message = f"""You are a senior code reviewer. Review this GitHub push and provide detailed feedback.
-
-TASK: Code review for push to {repo}/{branch}
-Pusher: {pusher}
-Commits:
-{commit_msgs}
-Compare URL: {compare_url}
-
-Steps:
-1. Fetch the diff for the latest commit using exec (get the last commit SHA from the list above):
-   curl -s -H "Authorization: token {GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.diff" https://api.github.com/repos/{repo}/commits/<LATEST_SHA>
-
-2. Analyze the diff carefully. Look for:
-   - Bugs, logic errors, edge cases
-   - Security vulnerabilities
-   - Performance problems
-   - Code style/readability issues
-   - Missing error handling
-   - Architecture/design concerns
-
-3. Write a detailed review in Ukrainian with clear sections:
-   **🔴 Критичні проблеми** (якщо є)
-   **🟡 Попередження**
-   **🟢 Хороші рішення**
-   **💡 Пропозиції**
-   **Підсумок**
-
-4. Post the review as a commit comment using exec:
-   curl -s -X POST \\
-     -H "Authorization: token {GITHUB_TOKEN}" \\
-     -H "Content-Type: application/json" \\
-     https://api.github.com/repos/{repo}/commits/<LATEST_SHA>/comments \\
-     -d '{{"body": "<YOUR_REVIEW_HERE>"}}'
-
-5. Send a summary to Telegram using the sessions_send tool with sessionKey="main". Start with "🔍 Push Review: [{repo}]({compare_url}) → {branch}".
-
-Be thorough but concise. Focus on actionable feedback."""
-
     else:
         return
 
-    # Trigger OpenClaw cron agentTurn in isolated session
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            resp = await client.post(
-                f"{OPENCLAW_GATEWAY_URL}/tools/invoke",
-                headers={
-                    "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "tool": "cron",
-                    "args": {
-                        "action": "add",
-                        "job": {
-                            "name": f"gh-review-{repo.replace('/', '-')}-{event_type}",
-                            "schedule": {"kind": "at", "at": "now"},
-                            "payload": {
-                                "kind": "agentTurn",
-                                "message": message,
-                                "timeoutSeconds": 300,
-                            },
-                            "sessionTarget": "isolated",
-                            "delivery": {"mode": "none"},
-                        },
-                    },
-                },
-            )
-            logger.info(f"OpenClaw cron response: {resp.status_code} {resp.text[:200]}")
-        except Exception as e:
-            logger.error(f"Failed to trigger OpenClaw: {e}")
+    script = os.path.join(os.path.dirname(__file__), "reviewer.py")
+    env = {**os.environ}
+
+    # Load .env explicitly so subprocess gets all vars
+    env_file = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+
+    logger.info(f"Spawning reviewer for {event_type} on {repo}")
+    try:
+        subprocess.Popen(
+            [sys.executable, script, json.dumps(payload), event_type],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception as e:
+        logger.error(f"Failed to spawn reviewer: {e}")
 
 
 @app.post("/webhook")
@@ -196,7 +96,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
     
-    background_tasks.add_task(trigger_review, event_type, payload)
+    background_tasks.add_task(lambda: trigger_review(event_type, payload))
     return JSONResponse({"status": "accepted", "event": event_type})
 
 
